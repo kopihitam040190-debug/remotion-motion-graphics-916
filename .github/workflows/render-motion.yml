@@ -1,0 +1,51 @@
+name: render-motion
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - utama
+    paths:
+      - "active_remotion_job.py"
+      - "jobs/active_remotion_job.py"
+      - ".github/workflows/render-motion.yml"
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js & Python
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg & fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core fonts-liberation
+
+      - name: Locate & run active_remotion_job.py
+        run: |
+          set -e
+          JOB_FILE=""
+          if [ -f "active_remotion_job.py" ]; then
+            JOB_FILE="active_remotion_job.py"
+          elif [ -f "jobs/active_remotion_job.py" ]; then
+            JOB_FILE="jobs/active_remotion_job.py"
+          fi
+
+          if [ -z "$JOB_FILE" ]; then
+            echo "File active_remotion_job.py belum ditemukan di root atau jobs/."
+            ls -la
+            exit 1
+          fi
+
+          echo "Menjalankan $JOB_FILE ..."
+          python3 -u "$JOB_FILE"

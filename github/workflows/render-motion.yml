@@ -1,0 +1,141 @@
+name: Render Remotion Motion Graphics (9:16)
+
+on:
+  push:
+    paths:
+      - 'active_remotion_job.py'
+      - 'jobs/active_remotion_job.py'
+      - '.github/workflows/render-motion.yml'
+  workflow_dispatch:
+    inputs:
+      upload_to_release:
+        description: 'Publikasikan hasil MP4 & cover.png ke GitHub Releases'
+        required: false
+        default: true
+        type: boolean
+      upload_to_gdrive:
+        description: 'Sinkronkan hasil ke Google Drive (butuh secret RCLONE_CONF_B64)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  render-video:
+    name: Remotion CPU Render & QC Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      STUDIO_DIR: /content/drive/MyDrive/Remotion Studio
+      NODE_OPTIONS: --max-old-space-size=4096
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Cek Aturan Motion Standards & Siapkan Direktori Studio
+        run: |
+          if [ -f ".agent/rules/motion-standards.md" ]; then
+            echo "Aturan .agent/rules/motion-standards.md terdeteksi."
+          fi
+
+          sudo mkdir -p "${STUDIO_DIR}/projects" "${STUDIO_DIR}/.cache" "/content/work"
+          sudo chown -R "$USER:$USER" /content
+
+          if [ -f "jobs/active_remotion_job.py" ]; then
+            cp "jobs/active_remotion_job.py" "${STUDIO_DIR}/active_remotion_job.py"
+          elif [ -f "active_remotion_job.py" ]; then
+            cp "active_remotion_job.py" "${STUDIO_DIR}/active_remotion_job.py"
+          else
+            echo "::error::File active_remotion_job.py tidak ditemukan di root maupun folder jobs/."
+            exit 1
+          fi
+
+      - name: 3. Pulihkan Cache Persisten (.tar & py_site)
+        uses: actions/cache@v4
+        with:
+          path: /content/drive/MyDrive/Remotion Studio/.cache
+          key: remotion-v3-cache-${{ runner.os }}-v1
+          restore-keys: |
+            remotion-v3-cache-${{ runner.os }}-
+
+      - name: 4. Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 5. Pasang Dependensi OS Sistem (FFmpeg & Font)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-liberation fonts-dejavu-core
+
+      - name: 6. Jalankan Pipeline Render active_remotion_job.py
+        working-directory: /content/drive/MyDrive/Remotion Studio
+        run: |
+          python3 -u active_remotion_job.py
+
+      - name: 7. Verifikasi Status Quality Gate
+        id: qc_check
+        run: |
+          STATUS_FILE="${STUDIO_DIR}/remotion_status.txt"
+          if [ -f "$STATUS_FILE" ]; then
+            cat "$STATUS_FILE"
+          fi
+
+          if ! grep -q "STATUS: COMPLETED" "$STATUS_FILE" 2>/dev/null; then
+            echo "::error::Render gagal atau tidak mencapai STATUS: COMPLETED."
+            if [ -f "${STUDIO_DIR}/projects/error_log.txt" ]; then
+              cat "${STUDIO_DIR}/projects/error_log.txt"
+            fi
+            exit 1
+          fi
+
+          mkdir -p "${GITHUB_WORKSPACE}/render_outputs"
+          cp -r "${STUDIO_DIR}/projects/"* "${GITHUB_WORKSPACE}/render_outputs/"
+          ls -lh "${GITHUB_WORKSPACE}/render_outputs/"
+
+      - name: 8. Simpan Log Error Jika Gagal
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remotion-error-logs-${{ github.run_number }}
+          path: |
+            /content/drive/MyDrive/Remotion Studio/remotion_status.txt
+            /content/drive/MyDrive/Remotion Studio/projects/error_log.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 9. Unggah ke GitHub Actions Artifacts (Unduh Cepat)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remotion-video-output-${{ github.run_number }}
+          path: render_outputs/*
+          retention-days: 7
+
+      - name: 10. Publikasikan ke GitHub Releases
+        if: success() && (github.event_name == 'push' || inputs.upload_to_release == true)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: render-${{ github.run_number }}
+          name: Render Output #${{ github.run_number }}
+          body: |
+            Hasil render otomatis **motion-graphic-v3** (Run `#${{ github.run_number }}`).
+            Berisi video final (`*_final.mp4`), sampul otomatis (`*_cover.png`), dan laporan QC (`*_render_report.json`).
+          files: |
+            render_outputs/*_final.mp4
+            render_outputs/*_cover.png
+            render_outputs/*_render_report.json
+
+      - name: 11. Sinkronkan ke Google Drive via rclone (Opsional)
+        if: success() && inputs.upload_to_gdrive == true && secrets.RCLONE_CONF_B64 != ''
+        env:
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF_B64 }}
+        run: |
+          curl -s https://rclone.org/install.sh | sudo bash
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
+          rclone copy "${GITHUB_WORKSPACE}/render_outputs/" "gdrive:Remotion Studio/projects/" --progress

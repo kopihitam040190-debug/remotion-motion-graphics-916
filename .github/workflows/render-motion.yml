@@ -1,51 +1,169 @@
-name: render-motion
+name: Render Motion Graphics (Remotion + Natural Edge-TTS)
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+      - master
       - utama
     paths:
       - "active_remotion_job.py"
       - "jobs/active_remotion_job.py"
       - ".github/workflows/render-motion.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: remotion-render-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      REMOTION_STUDIO_DIR: /content/drive/MyDrive/Remotion Studio
+      NODE_OPTIONS: --max-old-space-size=4096
+      PUPPETEER_CACHE_DIR: /tmp/remotion-chromium
+      PLAYWRIGHT_BROWSERS_PATH: /tmp/remotion-chromium
+
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js & Python
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - uses: actions/setup-python@v5
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install FFmpeg & fonts
+      - name: Locate Active Job File
+        id: locate_job
+        shell: bash
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core fonts-liberation
+          set -euo pipefail
+          JOB_PATH=""
+          for candidate in "active_remotion_job.py" "jobs/active_remotion_job.py"; do
+            if [ -f "$candidate" ]; then
+              JOB_PATH="$candidate"
+              break
+            fi
+          done
 
-      - name: Locate & run active_remotion_job.py
-        run: |
-          set -e
-          JOB_FILE=""
-          if [ -f "active_remotion_job.py" ]; then
-            JOB_FILE="active_remotion_job.py"
-          elif [ -f "jobs/active_remotion_job.py" ]; then
-            JOB_FILE="jobs/active_remotion_job.py"
-          fi
-
-          if [ -z "$JOB_FILE" ]; then
-            echo "File active_remotion_job.py belum ditemukan di root atau jobs/."
-            ls -la
+          if [ -z "$JOB_PATH" ]; then
+            echo "ERROR: active_remotion_job.py tidak ditemukan di root maupun jobs/."
             exit 1
           fi
 
-          echo "Menjalankan $JOB_FILE ..."
-          python3 -u "$JOB_FILE"
+          JOB_HASH=$(sha256sum "$JOB_PATH" | awk '{print $1}')
+          echo "job_path=$JOB_PATH" >> "$GITHUB_OUTPUT"
+          echo "job_hash=${JOB_HASH:0:16}" >> "$GITHUB_OUTPUT"
+          echo "Menggunakan job: $JOB_PATH (hash: ${JOB_HASH:0:16})"
+
+      - name: Restore Persistent Cache (Node, Chromium, Python TTS, APT)
+        id: cache_restore
+        uses: actions/cache@v4
+        with:
+          path: |
+            /content/drive/MyDrive/Remotion Studio/.cache
+            /tmp/remotion-chromium
+            /var/cache/apt/archives
+          key: remotion-v3-cache-${{ runner.os }}-${{ steps.locate_job.outputs.job_hash }}
+          restore-keys: |
+            remotion-v3-cache-${{ runner.os }}-
+
+      - name: Install FFmpeg, System Fonts & Python Edge-TTS (If Cache Miss)
+        shell: bash
+        run: |
+          set -euo pipefail
+          STUDIO_DIR="$REMOTION_STUDIO_DIR"
+          CACHE_DIR="$STUDIO_DIR/.cache"
+          PY_SITE="$CACHE_DIR/py_site"
+          mkdir -p "$STUDIO_DIR/projects" "$STUDIO_DIR/_archive" "$CACHE_DIR/node_template" "$CACHE_DIR/chromium" "$PY_SITE" /tmp/remotion-chromium
+
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg fonts-liberation fonts-dejavu-core
+          fi
+
+          export PYTHONPATH="$PY_SITE:${PYTHONPATH:-}"
+          if ! python3 -c "import edge_tts" >/dev/null 2>&1; then
+            python3 -m pip install -q --upgrade --no-warn-script-location --target "$PY_SITE" edge-tts
+          fi
+
+          if [ -f "$CACHE_DIR/chromium/chromium.tar" ] && [ -z "$(ls -A /tmp/remotion-chromium 2>/dev/null)" ]; then
+            tar -xf "$CACHE_DIR/chromium/chromium.tar" -C /tmp/remotion-chromium
+            chmod -R +x /tmp/remotion-chromium || true
+          fi
+
+      - name: Run Active Remotion Job
+        shell: bash
+        run: |
+          set -euo pipefail
+          STUDIO_DIR="$REMOTION_STUDIO_DIR"
+          CACHE_DIR="$STUDIO_DIR/.cache"
+          export PYTHONPATH="$CACHE_DIR/py_site:${PYTHONPATH:-}"
+
+          mkdir -p "$STUDIO_DIR"
+          cp "${{ steps.locate_job.outputs.job_path }}" "$STUDIO_DIR/active_remotion_job.py"
+          python3 "$STUDIO_DIR/active_remotion_job.py"
+
+      - name: Package Chromium Cache & Final Outputs
+        id: outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          STUDIO_DIR="$REMOTION_STUDIO_DIR"
+          CACHE_DIR="$STUDIO_DIR/.cache"
+          OUT_DIR="$GITHUB_WORKSPACE/dist_outputs"
+          mkdir -p "$OUT_DIR"
+
+          if [ -d "/tmp/remotion-chromium" ] && [ -n "$(ls -A /tmp/remotion-chromium 2>/dev/null)" ]; then
+            tar -cf "$CACHE_DIR/chromium/chromium.tar" -C /tmp/remotion-chromium . || true
+          fi
+
+          shopt -s nullglob
+          MP4_FILES=("$STUDIO_DIR/projects/"*_final.mp4)
+          PNG_FILES=("$STUDIO_DIR/projects/"*_cover.png)
+
+          if [ ${#MP4_FILES[@]} -eq 0 ]; then
+            echo "ERROR: Tidak ada file *_final.mp4 yang dihasilkan."
+            ls -la "$STUDIO_DIR/projects" || true
+            exit 1
+          fi
+
+          cp "${MP4_FILES[@]}" "$OUT_DIR/"
+          [ ${#PNG_FILES[@]} -gt 0 ] && cp "${PNG_FILES[@]}" "$OUT_DIR/"
+          ls -lh "$OUT_DIR"
+
+      - name: Upload Artifacts (Backup Download)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remotion-output-run-${{ github.run_number }}
+          path: |
+            dist_outputs/*_final.mp4
+            dist_outputs/*_cover.png
+          if-no-files-found: ignore
+
+      - name: Publish MP4 & Cover to GitHub Releases
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}-${{ github.run_id }}
+          name: "Render #${{ github.run_number }} (${{ steps.locate_job.outputs.job_hash }})"
+          body: |
+            Hasil render otomatis Remotion + Voice-Over Edge-TTS natural.
+            - **Video MP4:** `*_final.mp4`
+            - **Sampul (Cover):** `*_cover.png`
+          files: |
+            dist_outputs/*_final.mp4
+            dist_outputs/*_cover.png
